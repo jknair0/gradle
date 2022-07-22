@@ -18,7 +18,6 @@ package org.gradle.execution.plan;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Sets;
 import org.gradle.api.Action;
 import org.gradle.api.internal.project.ProjectInternal;
 import org.gradle.api.tasks.VerificationException;
@@ -32,10 +31,12 @@ import java.util.NavigableSet;
 import java.util.Set;
 import java.util.function.Consumer;
 
+import static org.gradle.execution.plan.NodeSets.newSortedNodeSet;
+
 /**
  * A node in the execution graph that represents some executable code with potential dependencies on other nodes.
  */
-public abstract class Node implements Comparable<Node> {
+public abstract class Node {
     @VisibleForTesting
     enum ExecutionState {
         // Node is not scheduled to run in any plan
@@ -67,8 +68,8 @@ public abstract class Node implements Comparable<Node> {
     private DependenciesState dependenciesState = DependenciesState.NOT_COMPLETE;
     private Throwable executionFailure;
     private boolean filtered;
-    private final NavigableSet<Node> dependencySuccessors = Sets.newTreeSet();
-    private final NavigableSet<Node> dependencyPredecessors = Sets.newTreeSet();
+    private final NavigableSet<Node> dependencySuccessors = newSortedNodeSet();
+    private final NavigableSet<Node> dependencyPredecessors = newSortedNodeSet();
     private final MutationInfo mutationInfo = new MutationInfo(this);
     private NodeGroup group = NodeGroup.DEFAULT_GROUP;
 
@@ -503,11 +504,29 @@ public abstract class Node implements Comparable<Node> {
     }
 
     /**
-     * Returns a node that should be executed prior to this node, once this node is ready to execute and it dependencies complete.
+     * Visits the "pre-execution" nodes of this node. These nodes should be treated as though they are dependencies of this node.
+     * This method is called when this node is ready to execute and its other dependencies are complete,
+     * allowing some dependencies of this node to be defined dynamically.
+     *
+     * <p>Note: there is currently no cycle detection applied to these dynamically added nodes or their dependencies.
+     * Support for this is not implemented yet and will be added later.
      */
-    @Nullable
-    public Node getPrepareNode() {
-        return null;
+    public void visitPreExecutionNodes(Consumer<? super Node> visitor) {
+    }
+
+    /**
+     * Visits the "post-execution" nodes of this node. These nodes should be treated as though they also produce the outputs or
+     * results of this node. That is, all nodes that depend on this node should also depend on these nodes. This method is called when
+     * this node has executed successfully and before any of its dependents are started, allowing some work of this node to be dynamically split
+     * up into other nodes that can run in parallel or with different resource requirements.
+     *
+     * <p>Note: there is currently no cycle detection applied to these dynamically added nodes or their dependencies.
+     * Support for this is not implemented yet and will be added later.
+     *
+     * <p>Note: mustRunAfter or finalizedBy relationship on this node is not honored for these dynamically added nodes or their dependencies.
+     * Support for this is not implemented yet and will be added later.
+     */
+    public void visitPostExecutionNodes(Consumer<? super Node> visitor) {
     }
 
     public MutationInfo getMutationInfo() {

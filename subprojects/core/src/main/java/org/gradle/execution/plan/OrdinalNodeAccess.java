@@ -16,32 +16,35 @@
 
 package org.gradle.execution.plan;
 
-import com.google.common.collect.Maps;
-import com.google.common.collect.Streams;
-
 import javax.annotation.Nullable;
-import java.util.List;
+import java.util.IdentityHashMap;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static com.google.common.collect.Streams.concat;
 
 /**
  * A factory for creating and accessing ordinal nodes
  */
 public class OrdinalNodeAccess {
-    private final Map<Integer, OrdinalGroup> groups = Maps.newHashMap();
-    private final Map<OrdinalGroup, OrdinalNode> destroyerLocationNodes = Maps.newHashMap();
-    private final Map<OrdinalGroup, OrdinalNode> producerLocationNodes = Maps.newHashMap();
+    private final OrdinalGroupFactory ordinalGroups;
+    private final IdentityHashMap<OrdinalGroup, OrdinalNode> destroyerLocationNodes = new IdentityHashMap<>();
+    private final IdentityHashMap<OrdinalGroup, OrdinalNode> producerLocationNodes = new IdentityHashMap<>();
+
+    public OrdinalNodeAccess(OrdinalGroupFactory ordinalGroups) {
+        this.ordinalGroups = ordinalGroups;
+    }
 
     OrdinalNode getOrCreateDestroyableLocationNode(OrdinalGroup ordinal) {
-        return destroyerLocationNodes.computeIfAbsent(ordinal, i -> createDestroyerLocationNode(ordinal));
+        return destroyerLocationNodes.computeIfAbsent(ordinal, this::createDestroyerLocationNode);
     }
 
     OrdinalNode getOrCreateOutputLocationNode(OrdinalGroup ordinal) {
-        return producerLocationNodes.computeIfAbsent(ordinal, i -> createProducerLocationNode(ordinal));
+        return producerLocationNodes.computeIfAbsent(ordinal, this::createProducerLocationNode);
     }
 
-    List<OrdinalNode> getAllNodes() {
-        return Streams.concat(destroyerLocationNodes.values().stream(), producerLocationNodes.values().stream()).collect(Collectors.toList());
+    Stream<OrdinalNode> getAllNodes() {
+        return concat(destroyerLocationNodes.values().stream(), producerLocationNodes.values().stream());
     }
 
     /**
@@ -50,19 +53,16 @@ public class OrdinalNodeAccess {
      * the ordinal group it represents have no explicit dependencies.
      */
     void createInterNodeRelationships() {
-        destroyerLocationNodes.forEach((ordinal, destroyer) -> {
+        createInterNodeRelationshipsFor(destroyerLocationNodes);
+        createInterNodeRelationshipsFor(producerLocationNodes);
+    }
+
+    private void createInterNodeRelationshipsFor(Map<OrdinalGroup, OrdinalNode> nodes) {
+        nodes.forEach((ordinal, node) -> {
             for (int i = 0; i < ordinal.getOrdinal(); i++) {
-                Node precedingNode = destroyerLocationNodes.get(group(i));
+                Node precedingNode = nodes.get(group(i));
                 if (precedingNode != null) {
-                    destroyer.addDependencySuccessor(precedingNode);
-                }
-            }
-        });
-        producerLocationNodes.forEach((ordinal, producer) -> {
-            for (int i = 0; i < ordinal.getOrdinal(); i++) {
-                Node precedingNode = producerLocationNodes.get(group(i));
-                if (precedingNode != null) {
-                    producer.addDependencySuccessor(precedingNode);
+                    node.addDependencySuccessor(precedingNode);
                 }
             }
         });
@@ -83,7 +83,7 @@ public class OrdinalNodeAccess {
     }
 
     public OrdinalGroup group(int ordinal) {
-        return groups.computeIfAbsent(ordinal, integer -> new OrdinalGroup(ordinal));
+        return ordinalGroups.group(ordinal);
     }
 
     @Nullable

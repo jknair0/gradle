@@ -16,7 +16,6 @@
 
 package org.gradle.composite.internal
 
-
 import org.gradle.api.Action
 import org.gradle.api.artifacts.component.BuildIdentifier
 import org.gradle.api.internal.DocumentationRegistry
@@ -32,6 +31,7 @@ import org.gradle.execution.plan.ExecutionNodeAccessHierarchies
 import org.gradle.execution.plan.ExecutionPlan
 import org.gradle.execution.plan.Node
 import org.gradle.execution.plan.NodeValidator
+import org.gradle.execution.plan.OrdinalGroupFactory
 import org.gradle.execution.plan.PlanExecutor
 import org.gradle.execution.plan.SelfExecutingNode
 import org.gradle.execution.plan.TaskDependencyResolver
@@ -54,7 +54,6 @@ import org.gradle.internal.snapshot.CaseSensitivity
 import org.gradle.internal.work.DefaultWorkerLeaseService
 import org.gradle.internal.work.WorkerLeaseService
 import org.gradle.util.internal.RedirectStdOutAndErr
-import org.jetbrains.annotations.NotNull
 import org.jetbrains.annotations.Nullable
 import org.junit.Rule
 import spock.lang.Shared
@@ -199,7 +198,7 @@ class DefaultIncludedBuildTaskGraphParallelTest extends AbstractIncludedBuildTas
         def builder = Mock(BuildLifecycleController.WorkGraphBuilder)
         def nodeFactory = new TaskNodeFactory(Stub(GradleInternal), Stub(DocumentationRegistry), Stub(BuildTreeWorkGraphController), Stub(NodeValidator))
         def hierarchies = new ExecutionNodeAccessHierarchies(CaseSensitivity.CASE_SENSITIVE, TestFiles.fileSystem())
-        def plan = new DefaultExecutionPlan(displayName, nodeFactory, Stub(TaskDependencyResolver), hierarchies.outputHierarchy, hierarchies.destroyableHierarchy, services.coordinationService)
+        def plan = new DefaultExecutionPlan(displayName, nodeFactory, new OrdinalGroupFactory(), Stub(TaskDependencyResolver), hierarchies.outputHierarchy, hierarchies.destroyableHierarchy, services.coordinationService)
         def workPlan = Stub(BuildWorkPlan) {
             _ * stop() >> { plan.close() }
         }
@@ -357,11 +356,6 @@ class DefaultIncludedBuildTaskGraphParallelTest extends AbstractIncludedBuildTas
         @Override
         String toString() {
             return displayName
-        }
-
-        @Override
-        int compareTo(@NotNull Node o) {
-            return -1
         }
 
         @Override
