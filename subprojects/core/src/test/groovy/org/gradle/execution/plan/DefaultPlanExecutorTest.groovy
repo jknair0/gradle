@@ -61,16 +61,20 @@ class DefaultPlanExecutorTest extends Specification {
         then:
         1 * cancellationHandler.isCancellationRequested() >> false
         1 * workerLease.tryLock() >> true
-        1 * workSource.executionState() >> WorkSource.State.MaybeWorkReadyToStart
         1 * workSource.selectNext() >> WorkSource.Selection.of(node)
+
+        then:
         1 * worker.execute(node)
+
+        then:
         1 * workSource.finishedExecuting(node, null)
-
-        then:
         1 * cancellationHandler.isCancellationRequested() >> false
-        1 * workSource.executionState() >> WorkSource.State.NoMoreWorkToStart
+        1 * workSource.selectNext() >> WorkSource.Selection.noMoreWorkToStart()
 
-        then:
+        // get rid of these
+        1 * cancellationHandler.isCancellationRequested() >> false
+        1 * workerLease.tryLock() >> true
+
         1 * workerLease.tryLock() >> true
         3 * workSource.allExecutionComplete() >> true
         1 * workSource.collectFailures([])
@@ -96,7 +100,6 @@ class DefaultPlanExecutorTest extends Specification {
 
         then:
         1 * cancellationHandler.isCancellationRequested() >> false
-        1 * workSource.executionState() >> WorkSource.State.MaybeWorkReadyToStart
         1 * workerLease.tryLock() >> true
         1 * workSource.selectNext() >> WorkSource.Selection.of(node)
         1 * worker.execute(node)
@@ -105,9 +108,12 @@ class DefaultPlanExecutorTest extends Specification {
         then:
         1 * cancellationHandler.isCancellationRequested() >> true
         1 * workSource.cancelExecution()
-        1 * workSource.executionState() >> WorkSource.State.NoMoreWorkToStart
+        1 * workSource.selectNext() >> WorkSource.Selection.noMoreWorkToStart()
 
-        then:
+        // get rid of these
+        1 * cancellationHandler.isCancellationRequested() >> false
+        1 * workerLease.tryLock() >> true
+
         1 * workerLease.tryLock() >> true
         3 * workSource.allExecutionComplete() >> true
         1 * workSource.collectFailures([])
