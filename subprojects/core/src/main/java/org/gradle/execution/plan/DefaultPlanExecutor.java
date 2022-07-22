@@ -24,6 +24,7 @@ import org.gradle.api.logging.Logging;
 import org.gradle.concurrent.ParallelismConfiguration;
 import org.gradle.initialization.BuildCancellationToken;
 import org.gradle.internal.Cast;
+import org.gradle.internal.MutableBoolean;
 import org.gradle.internal.MutableReference;
 import org.gradle.internal.build.ExecutionResult;
 import org.gradle.internal.concurrent.CompositeStoppable;
@@ -343,14 +344,17 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
                 releaseLeaseOnCompletion = false;
             }
 
+            WorkItem workItem = null;
             while (true) {
-                WorkItem workItem = getNextItem(workerLease);
+                if (workItem == null) {
+                    workItem = getNextItem(workerLease);
+                }
                 if (workItem == null) {
                     break;
                 }
                 Object selected = workItem.selection.getItem();
                 LOGGER.info("{} ({}) started.", selected, Thread.currentThread());
-                execute(selected, workItem.plan, workItem.executor);
+                workItem = executeAndTrySelectNext(selected, workItem.plan, workItem.executor);
             }
 
             if (releaseLeaseOnCompletion) {
@@ -368,87 +372,123 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
          */
         @Nullable
         private WorkItem getNextItem(final WorkerLease workerLease) {
-            final MutableReference<WorkItem> selected;
-            stats.startSelect();
-            try {
-                selected = MutableReference.empty();
+            final MutableReference<WorkSource.Selection<WorkItem>> selected = MutableReference.empty();
+            final MutableBoolean finished = new MutableBoolean();
+            while (true) {
+                // Attempt to obtain a worker lease and select the next item
+                stats.startSelect();
+                selected.set(WorkSource.Selection.noWorkReadyToStart());
                 coordinationService.withStateLock(resourceLockState -> {
                     if (cancellationToken.isCancellationRequested()) {
                         queue.cancelExecution();
                     }
 
-                    WorkSource.State state = queue.executionState();
-                    if (state == WorkSource.State.NoMoreWorkToStart) {
-                        return FINISHED;
-                    } else if (state == WorkSource.State.NoWorkReadyToStart) {
-                        // Release worker lease while waiting
-                        if (workerLease.isLockedByCurrentThread()) {
-                            workerLease.unlock();
-                        }
-                        return RETRY;
-                    }
-                    // Else there may be items ready, acquire a worker lease
-
+                    // Attempt to acquire a worker lease
                     boolean hasWorkerLease = workerLease.isLockedByCurrentThread();
                     if (!hasWorkerLease && !workerLease.tryLock()) {
-                        // Cannot get a lease to run work
-                        return RETRY;
+                        // Cannot get a lease to run work, need to wait
+                        return FINISHED;
                     }
 
-                    WorkSource.Selection<WorkItem> workItem;
+                    // Select the next item
                     try {
-                        workItem = queue.selectNext();
+                        WorkSource.Selection<WorkItem> workItem = queue.selectNext();
+                        selected.set(workItem);
+                        return FINISHED;
                     } catch (Throwable t) {
+                        // Treat this as a fatal problem
                         resourceLockState.releaseLocks();
                         queue.abortAllAndFail(t);
+                        selected.set(WorkSource.Selection.noMoreWorkToStart());
                         return FINISHED;
                     }
-                    if (workItem.isNoMoreWorkToStart()) {
-                        return FINISHED;
-                    } else if (workItem.isNoWorkReadyToStart()) {
-                        // Release worker lease while waiting
+                });
+                stats.finishSelect();
+
+                WorkSource.Selection<WorkItem> workItem = selected.get();
+                if (workItem == null || workItem.isNoMoreWorkToStart()) {
+                    return null;
+                }
+                if (!workItem.isNoWorkReadyToStart()) {
+                    return workItem.getItem();
+                }
+
+                // Release worker lease and wait until some work and a worker lease is available
+                stats.startWaiting();
+                coordinationService.withStateLock(resourceLockState -> {
+                    if (workerLease.isLockedByCurrentThread()) {
                         workerLease.unlock();
+                    }
+
+                    WorkSource.State state = queue.executionState();
+                    if (state == WorkSource.State.NoMoreWorkToStart) {
+                        // Queue is finished, can exit
+                        finished.set(true);
+                        return FINISHED;
+                    } else if (state == WorkSource.State.NoWorkReadyToStart) {
+                        // No work ready, keep waiting
                         return RETRY;
                     }
 
-                    selected.set(workItem.getItem());
+                    // There may be items ready, acquire a worker lease
+                    if (!workerLease.tryLock()) {
+                        // Cannot get a lease to run work, keep waiting
+                        return RETRY;
+                    }
+
+                    finished.set(false);
                     return FINISHED;
                 });
-            } finally {
-                stats.finishSelect();
-            }
-
-            return selected.get();
-        }
-
-        private void execute(Object selected, WorkSource<Object> executionPlan, Action<Object> worker) {
-            Throwable failure = null;
-            try {
-                stats.startExecute();
-                try {
-                    worker.execute(selected);
-                } catch (Throwable t) {
-                    failure = t;
-                } finally {
-                    stats.finishExecute();
+                stats.finishWaiting();
+                if (finished.get()) {
+                    return null;
                 }
-            } finally {
-                markFinished(selected, executionPlan, failure);
             }
         }
 
-        private void markFinished(Object selected, WorkSource<Object> executionPlan, @Nullable Throwable failure) {
+        /**
+         * Runs the given item and then attempts to select the next item.
+         */
+        @Nullable
+        private WorkItem executeAndTrySelectNext(Object selected, WorkSource<Object> executionPlan, Action<Object> worker) {
+            Throwable failure = null;
+            stats.startExecute();
+            try {
+                worker.execute(selected);
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                stats.finishExecute();
+            }
+            return markFinishedAndSelectNext(selected, executionPlan, failure);
+        }
+
+        @Nullable
+        private WorkItem markFinishedAndSelectNext(Object selected, WorkSource<Object> executionPlan, @Nullable Throwable failure) {
             stats.startMarkFinished();
             try {
-                coordinationService.withStateLock(() -> {
+                return coordinationService.withStateLock(() -> {
                     try {
                         executionPlan.finishedExecuting(selected, failure);
                     } catch (Throwable t) {
                         queue.abortAllAndFail(t);
+                        return null;
                     }
-                    // Notify other threads that the item is finished as this may unblock further work
-                    // or this might be the last item in the queue
-                    coordinationService.notifyStateChange();
+
+                    WorkSource.Selection<WorkItem> workItem = queue.selectNext();
+                    if (workItem.isNoWorkReadyToStart()) {
+                        return null;
+                    } else if (workItem.isNoMoreWorkToStart()) {
+                        // Notify other threads that there is nothing left in the queue
+                        coordinationService.notifyStateChange();
+                        return null;
+                    } else {
+                        if (executionPlan.executionState() == WorkSource.State.MaybeWorkReadyToStart) {
+                            // Notify other threads that there may be further work available
+                            coordinationService.notifyStateChange();
+                        }
+                        return workItem.getItem();
+                    }
                 });
             } finally {
                 stats.finishMarkFinished();
@@ -473,6 +513,10 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
 
         void finishSelect();
 
+        void startWaiting();
+
+        void finishWaiting();
+
         void startExecute();
 
         void finishExecute();
@@ -496,6 +540,14 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
 
         @Override
         public void finishSelect() {
+        }
+
+        @Override
+        public void startWaiting() {
+        }
+
+        @Override
+        public void finishWaiting() {
         }
 
         @Override
@@ -537,9 +589,11 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
             int workerCount = workers.size();
             LOGGER.lifecycle("worker count: " + workerCount);
             if (workerCount > 0) {
+                LOGGER.lifecycle("average worker time: " + format(stats -> stats.totalTime));
                 LOGGER.lifecycle("average select time: " + format(stats -> stats.totalSelectTime));
+                LOGGER.lifecycle("average wait time: " + format(stats -> stats.totalWaitTime));
                 LOGGER.lifecycle("average execute time: " + format(stats -> stats.totalExecuteTime));
-                LOGGER.lifecycle("average finish time: " + format(stats -> stats.totalMarkFinishedTime));
+                LOGGER.lifecycle("average finish and select next time: " + format(stats -> stats.totalMarkFinishedTime));
             }
             workers.clear();
         }
@@ -553,9 +607,10 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
     private static class CollectingWorkerStats implements WorkerStats {
         final long startTime;
         private final CollectingExecutorStats owner;
-        long finishTime;
         long startCurrentOperation;
+        long totalTime;
         long totalSelectTime;
+        long totalWaitTime;
         long totalExecuteTime;
         long totalMarkFinishedTime;
 
@@ -565,7 +620,7 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
         }
 
         public void finish() {
-            finishTime = System.nanoTime();
+            totalTime = System.nanoTime() - startTime;
             owner.workers.add(this);
         }
 
@@ -576,10 +631,17 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
 
         @Override
         public void finishSelect() {
-            long duration = System.nanoTime() - startCurrentOperation;
-            if (duration > 0) {
-                totalSelectTime += duration;
-            }
+            totalSelectTime = finishCurrentOperation();
+        }
+
+        @Override
+        public void startWaiting() {
+            startCurrentOperation = System.nanoTime();
+        }
+
+        @Override
+        public void finishWaiting() {
+            totalWaitTime += finishCurrentOperation();
         }
 
         @Override
@@ -589,10 +651,7 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
 
         @Override
         public void finishExecute() {
-            long duration = System.nanoTime() - startCurrentOperation;
-            if (duration > 0) {
-                totalExecuteTime += duration;
-            }
+            totalExecuteTime += finishCurrentOperation();
         }
 
         @Override
@@ -602,9 +661,15 @@ public class DefaultPlanExecutor implements PlanExecutor, Stoppable {
 
         @Override
         public void finishMarkFinished() {
+            totalMarkFinishedTime += finishCurrentOperation();
+        }
+
+        private long finishCurrentOperation() {
             long duration = System.nanoTime() - startCurrentOperation;
             if (duration > 0) {
-                totalMarkFinishedTime += duration;
+                return 0;
+            } else {
+                return duration;
             }
         }
     }
